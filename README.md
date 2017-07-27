@@ -1,3 +1,7 @@
+在wrk基础上增加了 -n 参数，类似ab的-n，可以指定最大多少次请求
+
+wrk -n20000 -c100 -t20 -d60m http://www.test.com
+
 # wrk - a HTTP benchmarking tool
 
   wrk is a modern HTTP benchmarking tool capable of generating significant

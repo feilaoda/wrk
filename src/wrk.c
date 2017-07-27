@@ -10,6 +10,7 @@ static struct config {
     uint64_t threads;
     uint64_t timeout;
     uint64_t pipeline;
+    uint64_t requests;
     bool     delay;
     bool     dynamic;
     bool     latency;
@@ -47,6 +48,7 @@ static void usage() {
            "    -c, --connections <N>  Connections to keep open   \n"
            "    -d, --duration    <T>  Duration of test           \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
+           "    -n, --requests     <N>  Max number of requests to use   \n"
            "                                                      \n"
            "    -s, --script      <S>  Load Lua script file       \n"
            "    -H, --header      <H>  Add header to request      \n"
@@ -57,6 +59,13 @@ static void usage() {
            "  Numeric arguments may include a SI unit (1k, 1M, 1G)\n"
            "  Time arguments may include a time unit (2s, 2m, 2h)\n");
 }
+
+void *thread_duration(void *arg) {
+    sleep(cfg.duration);
+    stop = 1;
+    return NULL;
+}
+
 
 int main(int argc, char **argv) {
     char *url, **headers = zmalloc(argc * sizeof(char *));
@@ -101,11 +110,16 @@ int main(int argc, char **argv) {
 
     cfg.host = host;
 
+    int max_requests = cfg.requests / cfg.threads;
+
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t      = &threads[i];
         t->loop        = aeCreateEventLoop(10 + cfg.connections * 3);
         t->connections = cfg.connections / cfg.threads;
-
+        t->max_requests = max_requests;
+        if(i + 1 == cfg.threads) {
+            t->max_requests = max_requests + cfg.requests - max_requests*cfg.threads;
+        }
         t->L = script_create(cfg.script, url, headers);
         script_init(L, t, argc - optind, &argv[optind]);
 
@@ -143,8 +157,12 @@ int main(int argc, char **argv) {
     uint64_t bytes    = 0;
     errors errors     = { 0 };
 
-    sleep(cfg.duration);
-    stop = 1;
+    // sleep(cfg.duration);
+    // stop = 1;
+
+    pthread_t sleep_thread;
+    pthread_create(&sleep_thread, NULL, &thread_duration, NULL);
+
 
     for (uint64_t i = 0; i < cfg.threads; i++) {
         thread *t = &threads[i];
@@ -198,6 +216,7 @@ int main(int argc, char **argv) {
 
     return 0;
 }
+
 
 void *thread_main(void *arg) {
     thread *thread = arg;
@@ -329,6 +348,7 @@ static int response_complete(http_parser *parser) {
 
     thread->complete++;
     thread->requests++;
+    thread->max_requests--;
 
     if (status > 399) {
         thread->errors.status++;
@@ -440,6 +460,16 @@ static void socket_readable(aeEventLoop *loop, int fd, void *data, int mask) {
         c->thread->bytes += n;
     } while (n == RECVBUF && sock.readable(c) > 0);
 
+    // printf("max requests: %d\n", c->thread->max_requests);
+
+    if(c->thread->max_requests <= 0) {
+      aeStop(loop);
+      // printf("requests == max_requests, thread exit.");
+      aeDeleteEventLoop(loop);
+      zfree(c->thread->cs);
+      pthread_exit(0);
+    }
+
     return;
 
   error:
@@ -470,6 +500,7 @@ static struct option longopts[] = {
     { "connections", required_argument, NULL, 'c' },
     { "duration",    required_argument, NULL, 'd' },
     { "threads",     required_argument, NULL, 't' },
+    { "requests",    required_argument, NULL, 'n' },
     { "script",      required_argument, NULL, 's' },
     { "header",      required_argument, NULL, 'H' },
     { "latency",     no_argument,       NULL, 'L' },
@@ -487,15 +518,19 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->threads     = 2;
     cfg->connections = 10;
     cfg->duration    = 10;
+    cfg->requests = 1000000000;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:n:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
                 break;
             case 'c':
                 if (scan_metric(optarg, &cfg->connections)) return -1;
+                break;
+            case 'n':
+                if (scan_metric(optarg, &cfg->requests)) return -1;
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
